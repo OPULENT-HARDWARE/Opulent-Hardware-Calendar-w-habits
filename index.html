@@ -3,8 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Opulent Hardware - Calendar v2 (Habit Squares)</title>
+  <title>Opulent Hardware - Calendar v2.1 (Habits + Save + Snapshot)</title>
   <link href="https://fonts.googleapis.com/css2?family=Saira:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <!-- html2canvas for snapshot -->
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
   <style>
     :root {
       /* DARK THEME — true black */
@@ -29,8 +31,8 @@
 
       /* habit grid metrics */
       --habit-gap: 4px;
-      --habit-pad: 10px;     /* inner padding inside a day tile for the grid */
-      --habit-top-reserve: 26px; /* reserve space for the date number */
+      --habit-pad: 10px;
+      --habit-top-reserve: 26px;
     }
 
     html[data-theme="dark"] {
@@ -125,7 +127,6 @@
       cursor: pointer;
       font-weight: 600;
     }
-
     .btn.icon { width: 36px; height: 32px; display:grid; place-items:center; padding:0; }
 
     .grid { display: grid; grid-template-rows: auto 1fr; height: 100%; min-height: 0; }
@@ -149,20 +150,18 @@
       background: linear-gradient(180deg, rgba(255,255,255,.045), rgba(255,255,255,.015));
       transition: transform .12s ease, box-shadow .12s ease, outline-color .12s ease;
       min-height: 0;
-      overflow: hidden; /* keep the squares clipped cleanly */
+      overflow: hidden;
+      touch-action: manipulation; /* better long-press handling */
     }
-
     .day:hover { transform: translateY(-2px); box-shadow: 0 8px 18px rgba(0,0,0,.35); }
     .num { position: absolute; top: 8px; right: 10px; font-size: .9rem; color: var(--muted); z-index: 2; }
 
-    /* Habit grid container fills the card, leaving space for date number */
     .habit-grid {
       position: absolute;
       inset: var(--habit-top-reserve) var(--habit-pad) var(--habit-pad) var(--habit-pad);
       display: grid;
       grid-auto-flow: row dense;
       gap: var(--habit-gap);
-      /* columns/rows are set dynamically by inline style via JS for best-fit squares */
     }
     .habit-square {
       width: var(--sq, 12px);
@@ -172,7 +171,6 @@
       box-shadow: 0 1px 0 rgba(255,255,255,.12) inset, 0 1px 6px rgba(0,0,0,.25);
     }
 
-    /* Today ring */
     .today {
       outline: 2px solid color-mix(in oklab, var(--accent) 60%, transparent);
       box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 25%, transparent);
@@ -184,35 +182,41 @@
       }
     }
 
-    /* Keyboard focus */
     .day:focus {
       outline: 2px solid rgba(255,255,255,.35);
       outline-offset: -2px;
       box-shadow: 0 0 0 3px rgba(255,255,255,.12);
     }
 
-    @media (prefers-reduced-motion: reduce){ .day { transition: none; } }
+    @media (prefers-reduced-motion: reduce){ .day { transition: none;}} 
     @media (max-width: 560px){ .dow { display: none; } .num { font-size: 0.85rem; } }
   </style>
 </head>
 <body>
-  <div class="frame">
+  <div class="frame" id="frame">
     <div class="top-wood">
       <div class="engrave">OPULENT&nbsp;HARDWARE</div>
     </div>
 
     <section class="panel">
       <header class="bar">
-        <div class="left-actions"></div>
+        <!-- FAR LEFT: Clear & Snapshot -->
+        <div class="left-actions">
+          <button class="btn" id="clearMonth" aria-label="Clear this month">Clear Month</button>
+          <button class="btn" id="snapshot" aria-label="Download snapshot">Snapshot</button>
+        </div>
+
         <div class="month-nav">
           <button class="btn icon" id="prev" aria-label="Previous month">◀</button>
           <div class="month-title" id="title">—</div>
           <button class="btn icon" id="next" aria-label="Next month">▶</button>
         </div>
+
         <div class="right-actions">
           <button class="toggle" id="mode" aria-label="Toggle theme">Toggle</button>
         </div>
       </header>
+
       <div class="grid">
         <div class="dow" id="dow"></div>
         <div class="days" id="days" role="grid" aria-label="Calendar month grid"></div>
@@ -221,7 +225,7 @@
   </div>
 
   <script>
-    /* ---- Params ---- */
+    /* ===== Params & Theme ===== */
     const params = new URLSearchParams(location.search);
     const themeParam = params.get('theme');
     const weekStart = Number(params.get('weekStart') ?? 0);
@@ -231,10 +235,13 @@
       document.documentElement.setAttribute('data-theme', themeParam);
     }
 
-    /* ---- Elements ---- */
+    /* ===== Elements ===== */
     const title = document.getElementById('title');
     const daysWrap = document.getElementById('days');
     const dowWrap = document.getElementById('dow');
+    const clearBtn = document.getElementById('clearMonth');
+    const snapshotBtn = document.getElementById('snapshot');
+    const frameEl = document.getElementById('frame');
 
     const WEEKDAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
@@ -249,35 +256,59 @@
       return new Date(y, (m || 1) - 1, 1);
     })();
 
-    /* ---- App State ----
-       events: (kept from v1 for future use)
-       habits: map of "YYYY-MM-DD" -> integer count
+    /* ===== App State =====
+       habits: { "YYYY-MM-DD": number }
+       persisted monthly as key "oh-cal-habits:YYYY-MM"
     */
-    const state = {
-      events: {},
-      habits: {}   // { "2025-10-22": 3, ... }
-    };
+    const state = { habits: {} };
 
-    /* ---- Date helpers ---- */
-    const fmtMonth = (date) => date.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }).toUpperCase();
+    /* ===== Date helpers ===== */
+    const fmtMonthTitle = (date) => date.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }).toUpperCase();
+    const fmtYearMonth = (date) => {
+      const y = date.getFullYear();
+      const m = String(date.getMonth() + 1).padStart(2, '0');
+      return `${y}-${m}`;
+    };
     const startOfMonth = (date) => new Date(date.getFullYear(), date.getMonth(), 1);
     const endOfMonth = (date) => new Date(date.getFullYear(), date.getMonth() + 1, 0);
-    function keyFor(date){
+    const keyFor = (date) => {
       const y = date.getFullYear();
       const m = String(date.getMonth() + 1).padStart(2, '0');
       const d = String(date.getDate()).padStart(2, '0');
       return `${y}-${m}-${d}`;
+    };
+
+    /* ===== Persistence ===== */
+    function storageKeyForMonth(date) {
+      return `oh-cal-habits:${fmtYearMonth(date)}`;
+    }
+    function loadMonth(date) {
+      const key = storageKeyForMonth(date);
+      try {
+        const raw = localStorage.getItem(key);
+        const parsed = raw ? JSON.parse(raw) : {};
+        // Ensure object of day->count
+        if (parsed && typeof parsed === 'object') return parsed;
+      } catch {}
+      return {};
+    }
+    function saveMonth(date, monthMap) {
+      const key = storageKeyForMonth(date);
+      try {
+        localStorage.setItem(key, JSON.stringify(monthMap || {}));
+      } catch (e) {
+        console.warn('LocalStorage save failed:', e);
+      }
+    }
+    function clearMonth(date) {
+      const key = storageKeyForMonth(date);
+      localStorage.removeItem(key);
     }
 
-    /* ---- Habit grid sizing ----
-       Given N squares and container size, choose cols/rows
-       and compute a square size that fits (with gap).
-    */
+    /* ===== Habit layout sizing ===== */
     function computeHabitLayout(n, w, h, gap) {
       if (n <= 0) return { cols: 0, rows: 0, size: 0 };
-      // Reserve space already by CSS insets; w/h are the content box passed in
       let best = { size: 0, cols: 1, rows: n };
-      // Try column counts around sqrt(n) for a near-square arrangement
       const s = Math.ceil(Math.sqrt(n));
       const candidates = new Set([1, 2, Math.max(1, s - 2), Math.max(1, s - 1), s, s + 1, s + 2, n]);
       for (const cols of candidates) {
@@ -290,23 +321,28 @@
       return best;
     }
 
-    /* ---- Render ---- */
+    /* ===== Render ===== */
     function render() {
       buildDOW();
+
+      // load persisted month into state.habits for the current month window
+      const monthCache = loadMonth(current);
+      state.habits = monthCache;
+
       const start = startOfMonth(current);
       const end = endOfMonth(current);
-      title.textContent = fmtMonth(current);
+      title.textContent = fmtMonthTitle(current);
+
       const startIdx = (start.getDay() - weekStart + 7) % 7;
       const daysInMonth = end.getDate();
       const today = new Date();
 
       const cells = startIdx + daysInMonth;
-      const rows = Math.ceil(cells / 7);
-      daysWrap.style.setProperty('--rows', rows);
+      daysWrap.style.setProperty('--rows', Math.ceil(cells / 7));
 
       const frag = document.createDocumentFragment();
 
-      // leading blanks (aria-hidden)
+      // leading blanks
       for (let i = 0; i < startIdx; i++) {
         const blank = document.createElement('div');
         blank.setAttribute('aria-hidden', 'true');
@@ -317,8 +353,7 @@
         const date = new Date(current.getFullYear(), current.getMonth(), d);
         const isToday = date.toDateString() === today.toDateString();
         const key = keyFor(date);
-        const evs = state.events[key] || [];
-        const habitCount = state.habits[key] || 0;
+        const habitCount = Number(state.habits[key] || 0);
 
         const cell = document.createElement('div');
         cell.className = `day ${isToday ? 'today' : ''}`;
@@ -332,49 +367,20 @@
         num.textContent = d;
         cell.appendChild(num);
 
-        // Optional: legacy event dots (kept for compatibility)
-        if (evs.length) {
-          const dots = document.createElement('div');
-          dots.style.position = 'absolute';
-          dots.style.left = '8px';
-          dots.style.bottom = '6px';
-          evs.slice(0, 3).forEach(() => {
-            const dot = document.createElement('span');
-            dot.style.display = 'inline-block';
-            dot.style.width = dot.style.height = '6px';
-            dot.style.marginRight = '4px';
-            dot.style.borderRadius = '50%';
-            dot.style.background = 'var(--accent)';
-            dots.appendChild(dot);
-          });
-          if (evs.length > 3) {
-            const more = document.createElement('span');
-            more.textContent = `+${evs.length - 3}`;
-            more.style.fontSize = '10px';
-            more.style.color = 'var(--muted)';
-            dots.appendChild(more);
-          }
-          cell.appendChild(dots);
-        }
-
-        // Habit grid container
         const grid = document.createElement('div');
         grid.className = 'habit-grid';
         grid.dataset.count = String(habitCount);
         cell.appendChild(grid);
 
-        // Defer square rendering until cell is in DOM and sized
         frag.appendChild(cell);
       }
 
       daysWrap.innerHTML = '';
       daysWrap.appendChild(frag);
 
-      // After mounting, size & render habit squares for each visible cell
       requestAnimationFrame(renderAllHabitSquares);
     }
 
-    /* Renders squares for every .habit-grid based on its data-count and size */
     function renderAllHabitSquares() {
       const grids = daysWrap.querySelectorAll('.habit-grid');
       grids.forEach(grid => renderHabitSquaresInGrid(grid));
@@ -385,19 +391,16 @@
       gridEl.innerHTML = '';
       if (count <= 0) return;
 
-      // Measure inner content box
       const rect = gridEl.getBoundingClientRect();
       const w = rect.width;
       const h = rect.height;
       const gap = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--habit-gap')) || 4;
 
       const layout = computeHabitLayout(count, w, h, gap);
-      // Set CSS grid template for best-fit
       gridEl.style.gridTemplateColumns = `repeat(${layout.cols}, 1fr)`;
       gridEl.style.gridTemplateRows = `repeat(${layout.rows}, 1fr)`;
       gridEl.style.setProperty('--sq', `${Math.max(6, layout.size)}px`);
 
-      // Create squares
       for (let i = 0; i < count; i++) {
         const sq = document.createElement('div');
         sq.className = 'habit-square';
@@ -405,26 +408,85 @@
       }
     }
 
-    /* ---- Interaction ----
-       Click a day to increment its habit count for that date.
-       (No delete yet—keeping V2 simple and intentional.)
-    */
+    /* ===== Update + Persist helpers ===== */
+    function setHabitCount(dateKey, count) {
+      state.habits[dateKey] = Math.max(0, count|0);
+      saveMonth(current, state.habits);
+    }
+    function incrementHabit(dateKey) {
+      const next = (state.habits[dateKey] || 0) + 1;
+      setHabitCount(dateKey, next);
+      return next;
+    }
+    function clearDay(dateKey) {
+      setHabitCount(dateKey, 0);
+    }
+
+    /* ===== Interaction ===== */
+    // Click to increment
     daysWrap.addEventListener('click', (e) => {
       const dayEl = e.target.closest('.day');
       if (!dayEl || !daysWrap.contains(dayEl)) return;
-      const key = dayEl.dataset.date;
-      if (!key) return;
-      state.habits[key] = (state.habits[key] || 0) + 1;
+      // Ignore if we just handled a long-press (flag)
+      if (dayEl.__longPressHandled) { dayEl.__longPressHandled = false; return; }
 
-      // Update just this cell’s habit grid
+      const key = dayEl.dataset.date;
       const grid = dayEl.querySelector('.habit-grid');
+      const next = incrementHabit(key);
       if (grid) {
-        grid.dataset.count = String(state.habits[key]);
+        grid.dataset.count = String(next);
         renderHabitSquaresInGrid(grid);
       }
     });
 
-    /* Nav + theme toggle */
+    // Long press to clear a day (press & hold ~600ms)
+    const LONG_MS = 600;
+    let pressTimer = null;
+    let pressTarget = null;
+
+    function startPressTimer(target) {
+      cancelPressTimer();
+      pressTarget = target;
+      pressTimer = setTimeout(() => {
+        if (!pressTarget) return;
+        const key = pressTarget.dataset.date;
+        const dateLabel = key;
+        const ok = confirm(`Clear all habit squares for ${dateLabel}?`);
+        pressTarget.__longPressHandled = true;
+        if (ok) {
+          clearDay(key);
+          const grid = pressTarget.querySelector('.habit-grid');
+          if (grid) {
+            grid.dataset.count = "0";
+            renderHabitSquaresInGrid(grid);
+          }
+        }
+        cancelPressTimer();
+      }, LONG_MS);
+    }
+    function cancelPressTimer() {
+      if (pressTimer) clearTimeout(pressTimer);
+      pressTimer = null;
+      pressTarget = null;
+    }
+
+    // Mouse
+    daysWrap.addEventListener('mousedown', (e) => {
+      const dayEl = e.target.closest('.day'); if (!dayEl) return;
+      startPressTimer(dayEl);
+    });
+    document.addEventListener('mouseup', cancelPressTimer);
+    document.addEventListener('mouseleave', cancelPressTimer);
+
+    // Touch
+    daysWrap.addEventListener('touchstart', (e) => {
+      const dayEl = e.target.closest('.day'); if (!dayEl) return;
+      startPressTimer(dayEl);
+    }, {passive:true});
+    daysWrap.addEventListener('touchend', cancelPressTimer);
+    daysWrap.addEventListener('touchcancel', cancelPressTimer);
+
+    /* ===== Nav + Theme + Actions ===== */
     document.getElementById('prev').onclick = () => {
       current = new Date(current.getFullYear(), current.getMonth() - 1, 1);
       render();
@@ -436,11 +498,42 @@
     document.getElementById('mode').onclick = () => {
       const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
       document.documentElement.setAttribute('data-theme', next);
-      // Repaint squares to ensure any subtle size changes recalc cleanly
       requestAnimationFrame(renderAllHabitSquares);
     };
 
-    /* Recompute on resize to keep squares snug */
+    clearBtn.onclick = () => {
+      const mKey = fmtYearMonth(current);
+      const ok = confirm(`Clear ALL habit squares for ${mKey}?`);
+      if (!ok) return;
+      clearMonth(current);
+      state.habits = {};
+      render();
+    };
+
+    snapshotBtn.onclick = async () => {
+      try {
+        // Temporarily remove focus styles to avoid rings in snapshot
+        const active = document.activeElement;
+        if (active && active.blur) active.blur();
+
+        const canvas = await html2canvas(frameEl, {
+          backgroundColor: null,       // keep theme background
+          scale: window.devicePixelRatio > 1 ? 2 : 1, // crisper export on HiDPI
+          useCORS: true
+        });
+        const dataUrl = canvas.toDataURL('image/png');
+        const link = document.createElement('a');
+        const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+        link.download = `Calendar_${fmtYearMonth(current)}_${theme}.png`;
+        link.href = dataUrl;
+        link.click();
+      } catch (err) {
+        alert('Snapshot failed. Try again.');
+        console.error(err);
+      }
+    };
+
+    /* Recompute squares when layout changes */
     window.addEventListener('resize', () => requestAnimationFrame(renderAllHabitSquares));
 
     /* Initial paint */
